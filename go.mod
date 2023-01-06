@@ -1,6 +1,7 @@
 module github.com/open-policy-agent/gatekeeper
 
 go 1.18
+// comment to trigger wf
 
 // Prevent otel dependencies from getting out of sync.
 replace (
