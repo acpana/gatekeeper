@@ -26,10 +26,14 @@ import (
 	syncc "github.com/open-policy-agent/gatekeeper/pkg/controller/sync"
 	"github.com/open-policy-agent/gatekeeper/pkg/expansion"
 	"github.com/open-policy-agent/gatekeeper/pkg/keys"
-	"github.com/open-policy-agent/gatekeeper/pkg/metrics"
+	"github.com/open-policy-agent/gatekeeper/pkg/syncutil"
+	"github.com/open-policy-agent/gatekeeper/pkg/syncutil/cmt"
+
+	//"github.com/open-policy-agent/gatekeeper/pkg/metrics"
 	"github.com/open-policy-agent/gatekeeper/pkg/mutation"
 	"github.com/open-policy-agent/gatekeeper/pkg/readiness"
-	"github.com/open-policy-agent/gatekeeper/pkg/target"
+
+	//"github.com/open-policy-agent/gatekeeper/pkg/target"
 	"github.com/open-policy-agent/gatekeeper/pkg/watch"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -59,6 +63,7 @@ type Adder struct {
 	Tracker          *readiness.Tracker
 	ProcessExcluder  *process.Excluder
 	WatchSet         *watch.Set
+	CacheManagerTracker *cmt.CacheManagerTracker
 }
 
 // Add creates a new ConfigController and adds it to the Manager with default RBAC. The Manager will set fields on the Controller
@@ -105,20 +110,26 @@ func (a *Adder) InjectWatchSet(watchSet *watch.Set) {
 	a.WatchSet = watchSet
 }
 
+func (a *Adder) InjectCMT(cmt *cmt.CacheManagerTracker) {
+	a.CacheManagerTracker = cmt
+}
+
 // newReconciler returns a new reconcile.Reconciler
 // events is the channel from which sync controller will receive the events
 // regEvents is the channel registered by Registrar to put the events in
 // events and regEvents point to same event channel except for testing.
-func newReconciler(mgr manager.Manager, opa syncc.OpaDataClient, wm *watch.Manager, cs *watch.ControllerSwitch, tracker *readiness.Tracker, processExcluder *process.Excluder, events <-chan event.GenericEvent, watchSet *watch.Set, regEvents chan<- event.GenericEvent) (*ReconcileConfig, error) {
-	filteredOpa := syncc.NewFilteredOpaDataClient(opa, watchSet)
-	syncMetricsCache := syncc.NewMetricsCache()
+func newReconciler(mgr manager.Manager, opa syncutil.OpaDataClient, wm *watch.Manager, cs *watch.ControllerSwitch, tracker *readiness.Tracker, processExcluder *process.Excluder, events <-chan event.GenericEvent, watchSet *watch.Set, regEvents chan<- event.GenericEvent) (*ReconcileConfig, error) {
+	filteredOpa := syncutil.NewFilteredOpaDataClient(opa, watchSet)
+	syncMetricsCache := syncutil.NewMetricsCache()
+	cmt := cmt.NewCacheManager(filteredOpa, syncMetricsCache)
 
 	syncAdder := syncc.Adder{
-		Opa:             filteredOpa,
+		//Opa:             filteredOpa,
 		Events:          events,
-		MetricsCache:    syncMetricsCache,
+		//MetricsCache:    syncMetricsCache,
 		Tracker:         tracker,
 		ProcessExcluder: processExcluder,
+		CMT: cmt,
 	}
 	// Create subordinate controller - we will feed it events dynamically via watch
 	if err := syncAdder.Add(mgr); err != nil {
@@ -140,11 +151,12 @@ func newReconciler(mgr manager.Manager, opa syncc.OpaDataClient, wm *watch.Manag
 		writer:           mgr.GetClient(),
 		statusClient:     mgr.GetClient(),
 		scheme:           mgr.GetScheme(),
-		opa:              filteredOpa,
+//		opa:              filteredOpa,
 		cs:               cs,
 		watcher:          w,
 		watched:          watchSet,
-		syncMetricsCache: syncMetricsCache,
+		// syncMetricsCache: syncMetricsCache,
+		cmt: cmt,
 		tracker:          tracker,
 		processExcluder:  processExcluder,
 	}, nil
@@ -176,8 +188,9 @@ type ReconcileConfig struct {
 	statusClient client.StatusClient
 
 	scheme           *runtime.Scheme
-	opa              syncc.OpaDataClient
-	syncMetricsCache *syncc.MetricsCache
+	// opa              syncc.OpaDataClient
+	// syncMetricsCache *syncc.MetricsCache
+	cmt *cmt.CacheManagerTracker
 	cs               *watch.ControllerSwitch
 	watcher          *watch.Registrar
 
@@ -321,15 +334,18 @@ func (r *ReconcileConfig) Reconcile(ctx context.Context, request reconcile.Reque
 
 func (r *ReconcileConfig) wipeCacheIfNeeded(ctx context.Context) error {
 	if r.needsWipe {
-		if _, err := r.opa.RemoveData(ctx, target.WipeData()); err != nil {
+		// if _, err := r.opa.RemoveData(ctx, target.WipeData()); err != nil {
+		// 	return err
+		// }
+
+		// // reset sync cache before sending the metric
+		// r.syncMetricsCache.ResetCache()
+		// r.syncMetricsCache.ReportSync(&syncc.Reporter{})
+
+		// r.needsWipe = false
+		if err := r.cmt.WipeCache(ctx, log); err != nil {
 			return err
 		}
-
-		// reset sync cache before sending the metric
-		r.syncMetricsCache.ResetCache()
-		r.syncMetricsCache.ReportSync(&syncc.Reporter{})
-
-		r.needsWipe = false
 	}
 	return nil
 }
@@ -337,52 +353,53 @@ func (r *ReconcileConfig) wipeCacheIfNeeded(ctx context.Context) error {
 // replayData replays all watched and cached data into Opa following a config set change.
 // In the future we can rework this to avoid the full opa data cache wipe.
 func (r *ReconcileConfig) replayData(ctx context.Context) error {
-	if r.needsReplay == nil {
-		return nil
-	}
-	for _, gvk := range r.needsReplay.Items() {
-		u := &unstructured.UnstructuredList{}
-		u.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   gvk.Group,
-			Version: gvk.Version,
-			Kind:    gvk.Kind + "List",
-		})
-		err := r.reader.List(ctx, u)
-		if err != nil {
-			return fmt.Errorf("replaying data for %+v: %w", gvk, err)
-		}
+	// if r.needsReplay == nil {
+	// 	return nil
+	// }
+	// for _, gvk := range r.needsReplay.Items() {
+	// 	u := &unstructured.UnstructuredList{}
+	// 	u.SetGroupVersionKind(schema.GroupVersionKind{
+	// 		Group:   gvk.Group,
+	// 		Version: gvk.Version,
+	// 		Kind:    gvk.Kind + "List",
+	// 	})
+	// 	err := r.reader.List(ctx, u)
+	// 	if err != nil {
+	// 		return fmt.Errorf("replaying data for %+v: %w", gvk, err)
+	// 	}
 
-		defer r.syncMetricsCache.ReportSync(&syncc.Reporter{})
+	// 	defer r.syncMetricsCache.ReportSync(&syncc.Reporter{})
 
-		for i := range u.Items {
-			syncKey := r.syncMetricsCache.GetSyncKey(u.Items[i].GetNamespace(), u.Items[i].GetName())
+	// 	for i := range u.Items {
+	// 		syncKey := r.syncMetricsCache.GetSyncKey(u.Items[i].GetNamespace(), u.Items[i].GetName())
 
-			isExcludedNamespace, err := r.skipExcludedNamespace(&u.Items[i])
-			if err != nil {
-				log.Error(err, "error while excluding namespaces")
-			}
+	// 		isExcludedNamespace, err := r.skipExcludedNamespace(&u.Items[i])
+	// 		if err != nil {
+	// 			log.Error(err, "error while excluding namespaces")
+	// 		}
 
-			if isExcludedNamespace {
-				continue
-			}
+	// 		if isExcludedNamespace {
+	// 			continue
+	// 		}
 
-			if _, err := r.opa.AddData(ctx, &u.Items[i]); err != nil {
-				r.syncMetricsCache.AddObject(syncKey, syncc.Tags{
-					Kind:   u.Items[i].GetKind(),
-					Status: metrics.ErrorStatus,
-				})
-				return fmt.Errorf("adding data for %+v: %w", gvk, err)
-			}
+	// 		if _, err := r.opa.AddData(ctx, &u.Items[i]); err != nil {
+	// 			r.syncMetricsCache.AddObject(syncKey, syncc.Tags{
+	// 				Kind:   u.Items[i].GetKind(),
+	// 				Status: metrics.ErrorStatus,
+	// 			})
+	// 			return fmt.Errorf("adding data for %+v: %w", gvk, err)
+	// 		}
 
-			r.syncMetricsCache.AddObject(syncKey, syncc.Tags{
-				Kind:   u.Items[i].GetKind(),
-				Status: metrics.ActiveStatus,
-			})
-		}
-		r.needsReplay.Remove(gvk)
-	}
-	r.needsReplay = nil
-	return nil
+	// 		r.syncMetricsCache.AddObject(syncKey, syncc.Tags{
+	// 			Kind:   u.Items[i].GetKind(),
+	// 			Status: metrics.ActiveStatus,
+	// 		})
+	// 	}
+	// 	r.needsReplay.Remove(gvk)
+	// }
+	// r.needsReplay = nil
+	// return nil
+	return r.cmt.ReplayData(ctx, r.reader, r.needsReplay, r.processExcluder, log)
 }
 
 // removeStaleExpectations stops tracking data for any resources that are no longer watched.
