@@ -16,7 +16,9 @@ limitations under the License.
 package config
 
 import (
+	"flag"
 	"fmt"
+	"os"
 	gosync "sync"
 	"testing"
 	"time"
@@ -45,12 +47,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
-	ctrl "sigs.k8s.io/controller-runtime"
+	"k8s.io/klog/v2"
+	//ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	//"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -67,7 +70,13 @@ const timeout = time.Second * 20
 func setupManager(t *testing.T) (manager.Manager, *watch.Manager) {
 	t.Helper()
 
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	//ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+
+	fs := flag.NewFlagSet("", flag.PanicOnError)
+	klog.InitFlags(fs)
+	fs.Parse([]string{"--alsologtostderr", "-v=10"})
+	klog.SetOutput(os.Stderr)
+	
 	metrics.Registry = prometheus.NewRegistry()
 	mgr, err := manager.New(cfg, manager.Options{
 		MetricsBindAddress: "0",
