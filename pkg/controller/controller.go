@@ -18,12 +18,15 @@ package controller
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"sync"
 
 	constraintclient "github.com/open-policy-agent/frameworks/constraint/pkg/client"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/externaldata"
 	cm "github.com/open-policy-agent/gatekeeper/v3/pkg/controller/cachemanager"
+	syncc "github.com/open-policy-agent/gatekeeper/v3/pkg/controller/cachemanager/sync"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller/config"
 	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller/config/process"
 	"github.com/open-policy-agent/gatekeeper/v3/pkg/expansion"
 	"github.com/open-policy-agent/gatekeeper/v3/pkg/fakes"
@@ -39,6 +42,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
@@ -73,6 +77,7 @@ type PubsubInjector interface {
 
 type CacheManagerInjector interface {
 	InjectCacheManager(cm *cm.CacheManager)
+	InjectEventsCh(events chan event.GenericEvent)
 }
 
 // Injectors is a list of adder structs that need injection. We can convert this
@@ -166,11 +171,6 @@ func AddToManager(m manager.Manager, deps *Dependencies) error {
 		}
 		deps.GetPod = fakePodGetter
 	}
-
-	filteredOpa := syncutil.NewFilteredOpaDataClient(deps.Opa, deps.WatchSet)
-	syncMetricsCache := syncutil.NewMetricsCache()
-	cm := cm.NewCacheManager(&cm.CacheManagerConfig{Opa: filteredOpa, SyncMetricsCache: syncMetricsCache, Tracker: deps.Tracker, ProcessExcluder: deps.ProcessExcluder})
-
 	for _, a := range Injectors {
 		a.InjectOpa(deps.Opa)
 		a.InjectWatchManager(deps.WatchManger)
@@ -193,7 +193,32 @@ func AddToManager(m manager.Manager, deps *Dependencies) error {
 		}
 		if a2, ok := a.(CacheManagerInjector); ok {
 			// this is used by the config controller to sync
+
+			// Events will be used to receive events from dynamic watches registered
+			// via the registrar below.
+			events := make(chan event.GenericEvent, 1024)
+			filteredOpa := syncutil.NewFilteredOpaDataClient(deps.Opa, deps.WatchSet)
+			syncMetricsCache := syncutil.NewMetricsCache()
+			w, err := deps.WatchManger.NewRegistrar(
+				config.CtrlName,
+				events)
+			if err != nil {
+				return err
+			}
+			cm := cm.NewCacheManager(nil, &cm.CacheManagerConfig{Opa: filteredOpa, SyncMetricsCache: syncMetricsCache, Tracker: deps.Tracker, ProcessExcluder: deps.ProcessExcluder, Registrar: w, WatchedSet: deps.WatchSet})
+
 			a2.InjectCacheManager(cm)
+			a2.InjectEventsCh(events)
+
+			syncAdder := syncc.Adder{
+				Events:       events,
+				CacheManager: cm,
+			}
+
+			// Create subordinate controller - we will feed it events dynamically via watch
+			if err := syncAdder.Add(m); err != nil {
+				return fmt.Errorf("registering sync controller: %w", err)
+			}
 		}
 
 		if err := a.Add(m); err != nil {

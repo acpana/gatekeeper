@@ -2,6 +2,7 @@ package aggregator
 
 import (
 	"fmt"
+	"strings"
 	gosync "sync"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -46,7 +47,7 @@ func (b *GVKAgreggator) IsPresent(gvk schema.GroupVersionKind) bool {
 	return found
 }
 
-// Remove deletes the any associations that Key k has in the GVKAggregator.
+// Remove deletes any associations that Key k has in the GVKAggregator.
 // For any GVK in the association k --> [GVKs], we also delete any associations
 // between the GVK and the Key k stored in the reverse map.
 func (b *GVKAgreggator) Remove(k Key) error {
@@ -63,6 +64,60 @@ func (b *GVKAgreggator) Remove(k Key) error {
 	}
 
 	delete(b.store, k)
+	return nil
+}
+
+func (b *GVKAgreggator) String() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	var sb strings.Builder
+
+	sb.WriteString("store:\n")
+	for key, gvks := range b.store {
+		sb.WriteString(fmt.Sprintf("Key: %v\n", key))
+		for gvk := range gvks {
+			sb.WriteString(fmt.Sprintf("  GVK: %s\n", gvk.String()))
+		}
+	}
+
+	sb.WriteString("\nreverseStore:\n")
+	for gvk, keys := range b.reverseStore {
+		sb.WriteString(fmt.Sprintf("GVK: %s\n", gvk.String()))
+		for key := range keys {
+			sb.WriteString(fmt.Sprintf("  Key: %v\n", key))
+		}
+	}
+
+	return sb.String()
+}
+
+// todo docs.
+func (b *GVKAgreggator) RemoveGVKsForKey(k Key, gvksToRemove []schema.GroupVersionKind) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	existingGVKs, found := b.store[k]
+	if !found {
+		return nil
+	}
+
+	gvksToRemoveMap := map[schema.GroupVersionKind]struct{}{}
+	for _, gvkToRemove := range gvksToRemove {
+		gvksToRemoveMap[gvkToRemove] = struct{}{}
+		delete(existingGVKs, gvkToRemove)
+	}
+
+	if err := b.pruneReverseStore(gvksToRemoveMap, k); err != nil {
+		return err
+	}
+
+	if len(existingGVKs) == 0 {
+		delete(b.store, k)
+	} else {
+		b.store[k] = existingGVKs // remaining gvks
+	}
+
 	return nil
 }
 
@@ -97,6 +152,53 @@ func (b *GVKAgreggator) Upsert(k Key, gvks []schema.GroupVersionKind) error {
 
 	return nil
 }
+
+// List returnes the gvk set for a given Key.
+func (b *GVKAgreggator) List(k Key) map[schema.GroupVersionKind]struct{} {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	gvks, _ := b.store[k]
+	return gvks
+}
+
+// todo docs.
+func (b *GVKAgreggator) ListAllGVKs() []schema.GroupVersionKind {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	allGVKs := []schema.GroupVersionKind{}
+	for gvk := range b.reverseStore {
+		allGVKs = append(allGVKs, gvk)
+	}
+	return allGVKs
+}
+
+func (b *GVKAgreggator) ListAllGVKsWithKeys() map[Key]map[schema.GroupVersionKind]struct{} {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	storeCpy := make(map[Key]map[schema.GroupVersionKind]struct{})
+	for key, gvks := range b.store {
+		gvksCpy := make(map[schema.GroupVersionKind]struct{})
+		for gvk := range gvks {
+			gvksCpy[gvk] = struct{}{}
+		}
+
+		storeCpy[key] = gvksCpy
+	}
+
+	return storeCpy
+}
+
+func (b *GVKAgreggator) Clear() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.store =       make(map[Key]map[schema.GroupVersionKind]struct{})
+		b.reverseStore = make(map[schema.GroupVersionKind]map[Key]struct{})
+}
+
 
 func (b *GVKAgreggator) pruneReverseStore(gvks map[schema.GroupVersionKind]struct{}, k Key) error {
 	for gvk := range gvks {

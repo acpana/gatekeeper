@@ -27,6 +27,7 @@ import (
 	"github.com/open-policy-agent/frameworks/constraint/pkg/client/drivers/rego"
 	configv1alpha1 "github.com/open-policy-agent/gatekeeper/v3/apis/config/v1alpha1"
 	cm "github.com/open-policy-agent/gatekeeper/v3/pkg/controller/cachemanager"
+	syncc "github.com/open-policy-agent/gatekeeper/v3/pkg/controller/cachemanager/sync"
 	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller/config/process"
 	"github.com/open-policy-agent/gatekeeper/v3/pkg/fakes"
 	"github.com/open-policy-agent/gatekeeper/v3/pkg/readiness"
@@ -37,8 +38,11 @@ import (
 	testclient "github.com/open-policy-agent/gatekeeper/v3/test/clients"
 	"github.com/open-policy-agent/gatekeeper/v3/test/testutils"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/net/context"
 	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -122,16 +126,7 @@ func TestReconcile(t *testing.T) {
 	mgr, wm := setupManager(t)
 	c := testclient.NewRetryClient(mgr.GetClient())
 
-	// initialize OPA
-	driver, err := rego.New(rego.Tracing(true))
-	if err != nil {
-		t.Fatalf("unable to set up Driver: %v", err)
-	}
-
-	opaClient, err := constraintclient.NewClient(constraintclient.Targets(&target.K8sValidationTarget{}), constraintclient.Driver(driver))
-	if err != nil {
-		t.Fatalf("unable to set up OPA client: %s", err)
-	}
+	opaClient := &fakes.FakeOpa{}
 
 	cs := watch.NewSwitch()
 	tracker, err := readiness.SetupTracker(mgr, false, false, false)
@@ -143,7 +138,19 @@ func TestReconcile(t *testing.T) {
 	events := make(chan event.GenericEvent, 1024)
 	watchSet := watch.NewSet()
 	syncMetricsCache := syncutil.NewMetricsCache()
-	cacheManager := cm.NewCacheManager(&cm.CacheManagerConfig{Opa: opaClient, SyncMetricsCache: syncMetricsCache, Tracker: tracker, ProcessExcluder: processExcluder})
+	w, err := wm.NewRegistrar(
+		CtrlName,
+		events)
+	require.NoError(t, err)
+	cacheManager := cm.NewCacheManager(nil, &cm.CacheManagerConfig{
+		Opa:              opaClient,
+		SyncMetricsCache: syncMetricsCache,
+		Tracker:          tracker,
+		ProcessExcluder:  processExcluder,
+		WatchedSet:       watchSet,
+		Registrar:        w,
+		Reader:           c,
+	})
 	rec, _ := newReconciler(mgr, cacheManager, wm, cs, tracker, processExcluder, events, watchSet, events)
 
 	recFn, requests := SetupTestReconcile(rec)
@@ -255,6 +262,26 @@ func TestReconcile(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	fooNs := &v1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "foo",
+		},
+	}
+	assert.NoError(t, c.Create(ctx, fooNs))
+	fooPod.Object["spec"] = map[string]interface{}{
+		"containers": []map[string]interface{}{
+			{
+				"name":  "foo-container",
+				"image": "foo-image",
+			},
+		},
+	}
+	assert.NoError(t, c.Create(ctx, fooPod))
+	defer assert.NoError(t, c.Delete(ctx, fooPod))
+
+	// fooPod should be namespace excluded, hence not synced
+	g.Eventually(opaClient.Contains(map[fakes.OpaKey]interface{}{{Gvk: fooPod.GroupVersionKind(), Key: "default"}: struct{}{}}), timeout).ShouldNot(gomega.BeTrue())
+
 	testMgrStopped()
 	cs.Stop()
 }
@@ -328,10 +355,8 @@ func TestConfig_DeleteSyncResources(t *testing.T) {
 	events := make(chan event.GenericEvent, 1024)
 
 	// set up controller and add it to the manager
-	err = setupController(mgr, wm, tracker, events)
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, err = setupController(mgr, wm, tracker, events, c, false)
+	assert.NoError(t, err, "failed to set up controller")
 
 	// start manager that will start tracker and controller
 	ctx, cancelFunc := context.WithCancel(context.Background())
@@ -378,16 +403,21 @@ func TestConfig_DeleteSyncResources(t *testing.T) {
 	}, timeout).Should(gomega.BeTrue())
 }
 
-func setupController(mgr manager.Manager, wm *watch.Manager, tracker *readiness.Tracker, events <-chan event.GenericEvent) error {
+func setupController(mgr manager.Manager, wm *watch.Manager, tracker *readiness.Tracker, events chan event.GenericEvent, reader client.Reader, useFakeOpa bool) (syncutil.OpaDataClient, error) {
 	// initialize OPA
-	driver, err := rego.New(rego.Tracing(true))
-	if err != nil {
-		return fmt.Errorf("unable to set up Driver: %w", err)
-	}
+	var opaClient syncutil.OpaDataClient
+	if useFakeOpa {
+		opaClient = &fakes.FakeOpa{}
+	} else {
+		driver, err := rego.New(rego.Tracing(true))
+		if err != nil {
+			return nil, fmt.Errorf("unable to set up Driver: %w", err)
+		}
 
-	opaClient, err := constraintclient.NewClient(constraintclient.Targets(&target.K8sValidationTarget{}), constraintclient.Driver(driver))
-	if err != nil {
-		return fmt.Errorf("unable to set up OPA backend client: %w", err)
+		opaClient, err = constraintclient.NewClient(constraintclient.Targets(&target.K8sValidationTarget{}), constraintclient.Driver(driver))
+		if err != nil {
+			return nil, fmt.Errorf("unable to set up OPA backend client: %w", err)
+		}
 	}
 
 	// ControllerSwitch will be used to disable controllers during our teardown process,
@@ -396,14 +426,39 @@ func setupController(mgr manager.Manager, wm *watch.Manager, tracker *readiness.
 	processExcluder := process.Get()
 	watchSet := watch.NewSet()
 	syncMetricsCache := syncutil.NewMetricsCache()
-	cacheManager := cm.NewCacheManager(&cm.CacheManagerConfig{Opa: opaClient, SyncMetricsCache: syncMetricsCache, Tracker: tracker, ProcessExcluder: processExcluder})
-
-	rec, _ := newReconciler(mgr, cacheManager, wm, cs, tracker, processExcluder, events, watchSet, nil)
+	w, err := wm.NewRegistrar(
+		CtrlName,
+		events)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create registrar: %w", err)
+	}
+	cacheManager := cm.NewCacheManager(nil, &cm.CacheManagerConfig{
+		Opa:              opaClient,
+		SyncMetricsCache: syncMetricsCache,
+		Tracker:          tracker,
+		ProcessExcluder:  processExcluder,
+		WatchedSet:       watchSet,
+		Registrar:        w,
+		Reader:           reader,
+	})
+	rec, err := newReconciler(mgr, cacheManager, wm, cs, tracker, processExcluder, events, watchSet, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating reconciler: %w", err)
+	}
 	err = add(mgr, rec)
 	if err != nil {
-		return fmt.Errorf("adding reconciler to manager: %w", err)
+		return nil, fmt.Errorf("adding reconciler to manager: %w", err)
 	}
-	return nil
+
+	syncAdder := syncc.Adder{
+		Events:       events,
+		CacheManager: cacheManager,
+	}
+	err = syncAdder.Add(mgr)
+	if err != nil {
+		return nil, fmt.Errorf("registering sync controller: %w", err)
+	}
+	return opaClient, nil
 }
 
 // Verify the Opa cache is populated based on the config resource.
@@ -427,9 +482,6 @@ func TestConfig_CacheContents(t *testing.T) {
 	// Setup the Manager and Controller.
 	mgr, wm := setupManager(t)
 	c := testclient.NewRetryClient(mgr.GetClient())
-
-	opaClient := &fakes.FakeOpa{}
-	cs := watch.NewSwitch()
 	tracker, err := readiness.SetupTracker(mgr, false, false, false)
 	if err != nil {
 		t.Fatal(err)
@@ -438,15 +490,10 @@ func TestConfig_CacheContents(t *testing.T) {
 	processExcluder.Add(instance.Spec.Match)
 
 	events := make(chan event.GenericEvent, 1024)
-	watchSet := watch.NewSet()
-	syncMetricsCache := syncutil.NewMetricsCache()
-	cacheManager := cm.NewCacheManager(&cm.CacheManagerConfig{Opa: opaClient, SyncMetricsCache: syncMetricsCache, Tracker: tracker, ProcessExcluder: processExcluder})
-
-	rec, _ := newReconciler(mgr, cacheManager, wm, cs, tracker, processExcluder, events, watchSet, events)
-	err = add(mgr, rec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	opaClient, err := setupController(mgr, wm, tracker, events, c, true)
+	assert.NoError(t, err, "failed to set up controller")
+	fOpaClient, ok := opaClient.(*fakes.FakeOpa)
+	require.True(t, ok)
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	testutils.StartManager(ctx, t, mgr)
@@ -511,11 +558,11 @@ func TestConfig_CacheContents(t *testing.T) {
 		// kube-system namespace is being excluded, it should not be in opa cache
 	}
 	g.Eventually(func() bool {
-		return opaClient.Contains(expected)
+		return fOpaClient.Contains(expected)
 	}, 10*time.Second).Should(gomega.BeTrue(), "checking initial opa cache contents")
 
 	// Sanity
-	if !opaClient.HasGVK(nsGVK) {
+	if !fOpaClient.HasGVK(nsGVK) {
 		t.Fatal("want opaClient.HasGVK(nsGVK) to be true but got false")
 	}
 
@@ -532,7 +579,7 @@ func TestConfig_CacheContents(t *testing.T) {
 
 	// Expect namespaces to go away from cache
 	g.Eventually(func() bool {
-		return opaClient.HasGVK(nsGVK)
+		return fOpaClient.HasGVK(nsGVK)
 	}, 10*time.Second).Should(gomega.BeFalse())
 
 	// Expect our configMap to return at some point
@@ -544,7 +591,7 @@ func TestConfig_CacheContents(t *testing.T) {
 		}: nil,
 	}
 	g.Eventually(func() bool {
-		return opaClient.Contains(expected)
+		return fOpaClient.Contains(expected)
 	}, 10*time.Second).Should(gomega.BeTrue(), "waiting for ConfigMap to repopulate in cache")
 
 	expected = map[fakes.OpaKey]interface{}{
@@ -554,11 +601,11 @@ func TestConfig_CacheContents(t *testing.T) {
 		}: nil,
 	}
 	g.Eventually(func() bool {
-		return !opaClient.Contains(expected)
+		return !fOpaClient.Contains(expected)
 	}, 10*time.Second).Should(gomega.BeTrue(), "kube-system namespace is excluded. kube-system/config-test-2 should not be in opa cache")
 
 	// Delete the config resource - expect opa to empty out.
-	if opaClient.Len() == 0 {
+	if fOpaClient.Len() == 0 {
 		t.Fatal("sanity")
 	}
 	err = c.Delete(ctx, instance)
@@ -568,7 +615,7 @@ func TestConfig_CacheContents(t *testing.T) {
 
 	// The cache will be cleared out.
 	g.Eventually(func() int {
-		return opaClient.Len()
+		return fOpaClient.Len()
 	}, 10*time.Second).Should(gomega.BeZero(), "waiting for cache to empty")
 }
 
@@ -584,9 +631,7 @@ func TestConfig_Retries(t *testing.T) {
 		Version: "v1",
 		Kind:    "ConfigMap",
 	}
-	instance := configFor([]schema.GroupVersionKind{
-		configMapGVK,
-	})
+	instance := configFor([]schema.GroupVersionKind{nsGVK, configMapGVK})
 
 	// Setup the Manager and Controller.
 	mgr, wm := setupManager(t)
@@ -604,13 +649,29 @@ func TestConfig_Retries(t *testing.T) {
 	events := make(chan event.GenericEvent, 1024)
 	watchSet := watch.NewSet()
 	syncMetricsCache := syncutil.NewMetricsCache()
-	cacheManager := cm.NewCacheManager(&cm.CacheManagerConfig{Opa: opaClient, SyncMetricsCache: syncMetricsCache, Tracker: tracker, ProcessExcluder: processExcluder})
-
+	w, err := wm.NewRegistrar(
+		CtrlName,
+		events)
+	require.NoError(t, err)
+	cacheManager := cm.NewCacheManager(nil, &cm.CacheManagerConfig{
+		Opa:              opaClient,
+		SyncMetricsCache: syncMetricsCache,
+		Tracker:          tracker,
+		ProcessExcluder:  processExcluder,
+		WatchedSet:       watchSet,
+		Registrar:        w,
+		Reader:           c,
+	})
 	rec, _ := newReconciler(mgr, cacheManager, wm, cs, tracker, processExcluder, events, watchSet, events)
 	err = add(mgr, rec)
 	if err != nil {
 		t.Fatal(err)
 	}
+	syncAdder := syncc.Adder{
+		Events:       events,
+		CacheManager: cacheManager,
+	}
+	assert.NoError(t, syncAdder.Add(mgr), "registering sync controller")
 
 	// Use our special hookReader to inject controlled failures
 	failPlease := make(chan string, 1)
@@ -677,20 +738,11 @@ func TestConfig_Retries(t *testing.T) {
 		return opaClient.Contains(expected)
 	}, 10*time.Second).Should(gomega.BeTrue(), "checking initial opa cache contents")
 
-	// Wipe the opa cache, we want to see it repopulate despite transient replay errors below.
-	_, err = opaClient.RemoveData(ctx, target.WipeData())
-	if err != nil {
-		t.Fatalf("wiping opa cache: %v", err)
-	}
-	if opaClient.Contains(expected) {
-		t.Fatal("wipe failed")
-	}
-
 	// Make List fail once for ConfigMaps as the replay occurs following the reconfig below.
 	failPlease <- "ConfigMapList"
 
-	// Reconfigure to add a namespace watch.
-	instance = configFor([]schema.GroupVersionKind{nsGVK, configMapGVK})
+	// Reconfigure to force an internal replay.
+	instance = configFor([]schema.GroupVersionKind{configMapGVK})
 	forUpdate := instance.DeepCopy()
 	_, err = controllerutil.CreateOrUpdate(ctx, c, forUpdate, func() error {
 		forUpdate.Spec = instance.Spec
