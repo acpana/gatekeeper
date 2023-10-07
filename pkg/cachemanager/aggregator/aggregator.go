@@ -49,21 +49,29 @@ func (b *GVKAgreggator) IsPresent(gvk schema.GroupVersionKind) bool {
 // Remove deletes any associations that Key k has in the GVKAggregator.
 // For any GVK in the association k --> [GVKs], we also delete any associations
 // between the GVK and the Key k stored in the reverse map.
-func (b *GVKAgreggator) Remove(k Key) error {
+// Returns a list of GVKs that are not referenced anymore as a result of this call.
+func (b *GVKAgreggator) Remove(k Key) ([]schema.GroupVersionKind, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	gvks, found := b.store[k]
 	if !found {
-		return nil
+		return nil, nil
 	}
 
 	if err := b.pruneReverseStore(gvks, k); err != nil {
-		return err
+		return nil, err
 	}
 
 	delete(b.store, k)
-	return nil
+
+	gvksToReturn := []schema.GroupVersionKind{}
+	for g := range gvks {
+		if _, found := b.reverseStore[g]; !found {
+			gvksToReturn = append(gvksToReturn, g)
+		}
+	}
+	return gvksToReturn, nil
 }
 
 // Upsert stores an association between Key k and the list of GVKs

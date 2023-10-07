@@ -121,7 +121,7 @@ func (c *CacheManager) UpsertSource(ctx context.Context, sourceKey aggregator.Ke
 			return fmt.Errorf("internal error adding source: %w", err)
 		}
 	} else {
-		if err := c.gvksToSync.Remove(sourceKey); err != nil {
+		if _, err := c.gvksToSync.Remove(sourceKey); err != nil {
 			return fmt.Errorf("internal error removing source: %w", err)
 		}
 	}
@@ -207,7 +207,7 @@ func (c *CacheManager) RemoveSource(ctx context.Context, sourceKey aggregator.Ke
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.gvksToSync.Remove(sourceKey); err != nil {
+	if _, err := c.gvksToSync.Remove(sourceKey); err != nil {
 		return fmt.Errorf("internal error removing source: %w", err)
 	}
 

@@ -30,6 +30,7 @@ import (
 	mutationv1 "github.com/open-policy-agent/gatekeeper/v3/apis/mutations/v1"
 	mutationsv1alpha1 "github.com/open-policy-agent/gatekeeper/v3/apis/mutations/v1alpha1"
 	syncsetv1alpha1 "github.com/open-policy-agent/gatekeeper/v3/apis/syncset/v1alpha1"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/cachemanager/aggregator"
 	"github.com/open-policy-agent/gatekeeper/v3/pkg/keys"
 	"github.com/open-policy-agent/gatekeeper/v3/pkg/operations"
 	"github.com/open-policy-agent/gatekeeper/v3/pkg/syncutil"
@@ -73,6 +74,7 @@ type Tracker struct {
 	expansions           *objectTracker
 	constraints          *trackerMap
 	data                 *trackerMap
+	agg                  *aggregator.GVKAgreggator
 
 	ready               chan struct{}
 	constraintTrackers  *syncutil.SingleRunner
@@ -95,6 +97,7 @@ func newTracker(lister Lister, mutationEnabled, externalDataEnabled, expansionEn
 		syncsets:           newObjTracker(syncsetv1alpha1.GroupVersion.WithKind("SyncSet"), fn),
 		constraints:        newTrackerMap(fn),
 		data:               newTrackerMap(fn),
+		agg:                aggregator.NewGVKAggregator(),
 		ready:              make(chan struct{}),
 		constraintTrackers: &syncutil.SingleRunner{},
 
@@ -218,6 +221,34 @@ func (t *Tracker) TryCancelTemplate(ct *templates.ConstraintTemplate) {
 	log.V(1).Info("try to cancel tracking for template", "namespace", ct.GetNamespace(), "name", ct.GetName())
 	if t.templates.TryCancelExpect(ct) {
 		t.templateCleanup(ct)
+	}
+}
+
+func (t *Tracker) TryCancelConfig(c *configv1alpha1.Config) {
+	log.V(1).Info("try to cancel tracking for config")
+	if t.config.TryCancelExpect(c) {
+		t.maybeCleanupData(aggregator.Key{Source: "config", ID: keys.Config.String()})
+	}
+}
+
+func (t *Tracker) TryCancelSyncSet(s *syncsetv1alpha1.SyncSet) {
+	log.V(1).Info("try to cancel tracking for syncset", "namespace", s.GetNamespace(), "name", s.GetName())
+	if t.syncsets.TryCancelExpect(s) {
+		nnss := fmt.Sprintf("%s/%s", s.GetName(), s.GetNamespace())
+		sKey := aggregator.Key{Source: "syncset", ID: nnss}
+
+		t.maybeCleanupData(sKey)
+	}
+}
+
+func (t *Tracker) maybeCleanupData(key aggregator.Key) {
+	// get gvks that are unreferenced by this remove call
+	gvks, err := t.agg.Remove(key)
+	if err != nil {
+		log.Error(err, "trying to clean up data expectations")
+	}
+	for _, g := range gvks {
+		t.CancelData(g)
 	}
 }
 
@@ -731,8 +762,7 @@ func (t *Tracker) trackSyncSources(ctx context.Context) error {
 		t.syncsets.ExpectationsDone()
 		log.V(1).Info("syncset expectations populated")
 	}()
-
-	handled := make(map[schema.GroupVersionKind]struct{})
+	agg := aggregator.NewGVKAggregator()
 
 	cfg, err := t.getConfigResource(ctx)
 	if err != nil {
@@ -747,12 +777,18 @@ func (t *Tracker) trackSyncSources(ctx context.Context) error {
 			t.config.Expect(cfg)
 			log.V(1).Info("setting expectations for config", "configCount", 1)
 
+			gvks := []schema.GroupVersionKind{}
 			for _, entry := range cfg.Spec.Sync.SyncOnly {
-				handled[schema.GroupVersionKind{
+				gvks = append(gvks, schema.GroupVersionKind{
 					Group:   entry.Group,
 					Version: entry.Version,
 					Kind:    entry.Kind,
-				}] = struct{}{}
+				})
+			}
+
+			configKey := aggregator.Key{Source: "config", ID: keys.Config.String()}
+			if err := agg.Upsert(configKey, gvks); err != nil {
+				log.Error(err, "while setting up config expectations - skipping for readiness")
 			}
 		}
 	}
@@ -770,20 +806,29 @@ func (t *Tracker) trackSyncSources(ctx context.Context) error {
 			t.syncsets.Expect(&syncset)
 			log.V(1).Info("expecting syncset", "name", syncset.GetName(), "namespace", syncset.GetNamespace())
 
+			gvks := []schema.GroupVersionKind{}
 			for i := range syncset.Spec.GVKs {
 				gvk := syncset.Spec.GVKs[i].ToGroupVersionKind()
-				if _, ok := handled[gvk]; ok {
+				if t.agg.IsPresent(gvk) {
 					log.Info("duplicate GVK to sync", "gvk", gvk)
 				}
 
-				handled[gvk] = struct{}{}
+				gvks = append(gvks, gvk)
+			}
+
+			nnss := fmt.Sprintf("%s/%s", syncset.GetName(), syncset.GetNamespace())
+			syncsetKey := aggregator.Key{Source: "syncset", ID: nnss}
+			if err := agg.Upsert(syncsetKey, gvks); err != nil {
+				log.Error(err, fmt.Sprintf("while setting up syncset %s expectations - skipping for readiness", nnss))
 			}
 		}
 	}
 
+	t.acceptAgg(agg)
+
 	// Expect the resource kinds specified in the Config resource and all SyncSet resources.
 	// We will fail-open (resolve expectations) for GVKs that are unregistered.
-	for gvk := range handled {
+	for _, gvk := range agg.GVKs() {
 		g := gvk
 
 		// Set expectations for individual cached resources
@@ -797,6 +842,13 @@ func (t *Tracker) trackSyncSources(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (t *Tracker) acceptAgg(agg *aggregator.GVKAgreggator) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.agg = agg
 }
 
 // getConfigResource returns the Config singleton if present.

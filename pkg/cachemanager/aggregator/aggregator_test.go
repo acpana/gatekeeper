@@ -203,7 +203,8 @@ func Test_GVKAgreggator_Remove(t *testing.T) {
 		b := NewGVKAggregator()
 		key := Key{Source: "testSource", ID: "testID"}
 
-		require.NoError(t, b.Remove(key))
+		_, err := b.Remove(key)
+		require.NoError(t, err)
 	})
 
 	t.Run("Remove non-existing key", func(t *testing.T) {
@@ -213,7 +214,8 @@ func Test_GVKAgreggator_Remove(t *testing.T) {
 		gvks := []schema.GroupVersionKind{g1v1k1, g1v1k2}
 		require.NoError(t, b.Upsert(key1, gvks))
 
-		require.NoError(t, b.Remove(key2))
+		_, err := b.Remove(key2)
+		require.NoError(t, err)
 	})
 
 	t.Run("Remove existing key and verify reverseStore", func(t *testing.T) {
@@ -222,7 +224,8 @@ func Test_GVKAgreggator_Remove(t *testing.T) {
 		gvks := []schema.GroupVersionKind{g1v1k1, g1v1k2}
 		require.NoError(t, b.Upsert(key1, gvks))
 
-		require.NoError(t, b.Remove(key1))
+		_, err := b.Remove(key1)
+		require.NoError(t, err)
 
 		for _, gvk := range gvks {
 			require.False(t, b.IsPresent(gvk))
@@ -237,7 +240,8 @@ func Test_GVKAgreggator_Remove(t *testing.T) {
 		require.NoError(t, b.Upsert(key1, gvks))
 		require.NoError(t, b.Upsert(key2, gvks))
 
-		require.NoError(t, b.Remove(key1))
+		_, err := b.Remove(key1)
+		require.NoError(t, err)
 
 		for _, gvk := range gvks {
 			require.True(t, b.IsPresent(gvk))
@@ -252,7 +256,7 @@ func Test_GVKAgreggator_Remove(t *testing.T) {
 		require.NoError(t, b.Upsert(key, []schema.GroupVersionKind{g1v1k1}))
 		b.reverseStore[g1v1k1] = map[Key]struct{}{}
 
-		err2 := b.Remove(key)
+		_, err2 := b.Remove(key)
 		require.EqualError(t, err2, fmt.Sprintf("internal aggregator error: gvks stores are corrupted for key: {%s %s}", key.Source, key.ID))
 	})
 }
@@ -302,7 +306,8 @@ func Test_GVKAggreggator_E2E(t *testing.T) {
 	// key1 has: g1v1k1, g2v1k1, g1v1k2, g2v1k2
 	// key2 has: g2v2k2, g1v2k1, g1v2k2, g2v2k1
 	// now remove key1
-	require.NoError(t, b.Remove(key1))
+	_, err := b.Remove(key1)
+	require.NoError(t, err)
 
 	// untrack gvks that shouldn't exist in the
 	for _, gvk := range []schema.GroupVersionKind{g1v1k1, g2v1k1, g1v1k2, g2v1k2} {
